@@ -1,0 +1,66 @@
+# Example: GPU Workload ComputeClass with Karpenter Integration
+#
+# This example shows how to use ComputeClass priority rules for GPU workloads,
+# with fallback from preferred GPU types to alternatives.
+---
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: gpu-training
+spec:
+  priorities:
+    # Priority 0: Prefer spot A3 instances (H100 GPUs)
+    - spot: true
+      machineFamily: a3
+
+    # Priority 1: Fall back to spot A2 instances (A100 GPUs)
+    - spot: true
+      machineFamily: a2
+
+    # Priority 2: On-demand A3 if no spot available
+    - machineFamily: a3
+
+    # Priority 3: On-demand A2 as last resort
+    - machineFamily: a2
+
+---
+apiVersion: karpenter.k8s.gcp/v1alpha1
+kind: GCENodeClass
+metadata:
+  name: gpu-training
+spec:
+  computeClassRef:
+    name: gpu-training
+  serviceAccount: "karpenter@my-project.iam.gserviceaccount.com"
+  imageSelectorTerms:
+    - alias: ContainerOptimizedOS@latest
+  disks:
+    - category: pd-ssd
+      sizeGiB: 200
+      boot: true
+
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-training
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand", "spot"]
+        - key: karpenter.k8s.gcp/instance-gpu-count
+          operator: Gt
+          values: ["0"]
+      nodeClassRef:
+        apiVersion: karpenter.k8s.gcp/v1alpha1
+        kind: GCENodeClass
+        name: gpu-training
+  limits:
+    cpu: "500"
+    memory: 2000Gi
+    nvidia.com/gpu: "32"
+  disruption:
+    consolidationPolicy: WhenEmpty

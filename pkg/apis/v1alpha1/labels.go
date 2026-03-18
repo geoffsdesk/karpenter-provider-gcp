@@ -116,6 +116,10 @@ var (
 	AnnotationGCENodeClassHashVersion        = apis.Group + "/gcenodeclass-hash-version"
 	AnnotationInstanceTagged                 = apis.Group + "/tagged"
 
+	// ComputeClass-aware provisioning annotations
+	AnnotationComputeClassName     = apis.Group + "/compute-class-name"
+	AnnotationComputeClassPriority = apis.Group + "/compute-class-priority"
+
 	TagNodeClaim = coreapis.Group + "/nodeclaim"
 	TagName      = "Name"
 )

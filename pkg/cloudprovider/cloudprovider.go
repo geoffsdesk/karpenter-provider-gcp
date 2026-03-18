@@ -39,6 +39,7 @@ import (
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/apis/v1alpha1"
 	cloudproviderevents "github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/cloudprovider/events"
 	gcperrors "github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/errors"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/computeclass"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/instance"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/instancetype"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils"
@@ -52,20 +53,38 @@ type CloudProvider struct {
 	kubeClient client.Client
 	recorder   events.Recorder
 
-	instanceTypeProvider instancetype.Provider
-	instanceProvider     instance.Provider
+	instanceTypeProvider   instancetype.Provider
+	instanceProvider       instance.Provider
+	computeClassProvider   computeclass.Provider
+	computeClassEnabled    bool
 }
 
 func New(kubeClient client.Client,
 	recorder events.Recorder,
 	instanceTypeProvider instancetype.Provider,
 	instanceProvider instance.Provider,
+	opts ...Option,
 ) *CloudProvider {
-	return &CloudProvider{
+	cp := &CloudProvider{
 		kubeClient:           kubeClient,
 		recorder:             recorder,
 		instanceTypeProvider: instanceTypeProvider,
 		instanceProvider:     instanceProvider,
+	}
+	for _, opt := range opts {
+		opt(cp)
+	}
+	return cp
+}
+
+// Option configures optional features on the CloudProvider.
+type Option func(*CloudProvider)
+
+// WithComputeClassProvider enables ComputeClass-aware provisioning using the given provider.
+func WithComputeClassProvider(provider computeclass.Provider) Option {
+	return func(cp *CloudProvider) {
+		cp.computeClassProvider = provider
+		cp.computeClassEnabled = true
 	}
 }
 
@@ -105,10 +124,15 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	})
 
 	nc := c.instanceToNodeClaim(instance, instanceType)
-	nc.Annotations = lo.Assign(nc.Annotations, map[string]string{
+	annotations := map[string]string{
 		v1alpha1.AnnotationGCENodeClassHash:        nodeClass.Hash(),
 		v1alpha1.AnnotationGCENodeClassHashVersion: v1alpha1.GCENodeClassHashVersion,
-	})
+	}
+	// Track ComputeClass source if used
+	if nodeClass.Spec.ComputeClassRef != nil {
+		annotations[v1alpha1.AnnotationComputeClassName] = nodeClass.Spec.ComputeClassRef.Name
+	}
+	nc.Annotations = lo.Assign(nc.Annotations, annotations)
 	return nc, nil
 }
 
@@ -364,6 +388,20 @@ func (c *CloudProvider) resolveInstanceTypes(ctx context.Context, nodeClaim *kar
 	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
 	if err != nil {
 		return nil, err
+	}
+
+	// Apply ComputeClass priority filtering if enabled and configured
+	if c.computeClassEnabled && c.computeClassProvider != nil && nodeClass.Spec.ComputeClassRef != nil {
+		rules, err := c.computeClassProvider.Resolve(ctx, nodeClass.Spec.ComputeClassRef)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "failed to resolve ComputeClass, continuing with standard resolution")
+		} else if len(rules) > 0 {
+			instanceTypes = c.computeClassProvider.FilterAndReorder(ctx, instanceTypes, rules)
+			log.FromContext(ctx).V(1).Info("applied ComputeClass priority filtering",
+				"computeClass", nodeClass.Spec.ComputeClassRef.Name,
+				"candidateCount", len(instanceTypes),
+			)
+		}
 	}
 
 	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)

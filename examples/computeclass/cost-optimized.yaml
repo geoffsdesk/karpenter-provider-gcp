@@ -1,0 +1,80 @@
+# Example: Cost-Optimized ComputeClass with Karpenter Integration
+#
+# This example demonstrates the full pattern for using a GKE Custom Compute Class
+# with Karpenter's GCP provider. The ComputeClass defines priority-based fallback
+# rules, and the GCENodeClass references it via computeClassRef.
+#
+# Prerequisites:
+#   - GKE cluster version 1.33.3+ (ComputeClass independent of NAP)
+#   - NAP must be DISABLED (Karpenter replaces NAP)
+#   - Feature gate: --feature-gates=ComputeClassAwareProvisioning=true
+---
+# 1. GKE ComputeClass (owned by GKE, created by platform team)
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: cost-optimized
+spec:
+  priorities:
+    # Priority 0: Try spot N4 instances first (cheapest)
+    - spot: true
+      machineFamily: n4
+
+    # Priority 1: Fall back to spot N2 instances
+    - spot: true
+      machineFamily: n2
+
+    # Priority 2: Fall back to on-demand N4
+    - machineType: n4-standard-4
+
+    # Priority 3: Broadest fallback - any N2 on-demand
+    - machineFamily: n2
+
+---
+# 2. GCENodeClass (Karpenter GCP provider resource)
+apiVersion: karpenter.k8s.gcp/v1alpha1
+kind: GCENodeClass
+metadata:
+  name: cost-optimized
+spec:
+  # Reference to the ComputeClass above
+  computeClassRef:
+    name: cost-optimized
+
+  serviceAccount: "karpenter@my-project.iam.gserviceaccount.com"
+  imageSelectorTerms:
+    - alias: ContainerOptimizedOS@latest
+  disks:
+    - category: pd-balanced
+      sizeGiB: 100
+      boot: true
+
+---
+# 3. NodePool (Karpenter core resource)
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: cost-optimized
+spec:
+  template:
+    spec:
+      requirements:
+        # Allow both spot and on-demand (ComputeClass controls preference ordering)
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand", "spot"]
+        # Restrict to standard shapes
+        - key: karpenter.k8s.gcp/instance-shape
+          operator: In
+          values: ["standard", "highcpu", "highmem"]
+      nodeClassRef:
+        apiVersion: karpenter.k8s.gcp/v1alpha1
+        kind: GCENodeClass
+        name: cost-optimized
+  limits:
+    cpu: "1000"
+    memory: 1000Gi
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+  # Expire nodes after 72h to pick up new AMIs and rebalance
+  expireAfter: 72h

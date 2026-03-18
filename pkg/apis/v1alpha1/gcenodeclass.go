@@ -82,6 +82,13 @@ type GCENodeClassSpec struct {
 	// +kubebuilder:validation:MaxItems=20
 	// +optional
 	NetworkTags []NetworkTag `json:"networkTags,omitempty"`
+	// ComputeClassRef is a reference to a GKE Custom Compute Class (cloud.google.com/v1 ComputeClass).
+	// When specified, Karpenter reads the ComputeClass priority rules and uses them to
+	// filter and reorder instance type candidates during provisioning, combining Karpenter's
+	// lifecycle management with GKE's priority-based machine selection.
+	// Requires the ComputeClassAwareProvisioning feature gate to be enabled.
+	// +optional
+	ComputeClassRef *ComputeClassRef `json:"computeClassRef,omitempty"`
 }
 
 // ImageSelectorTerm defines selection logic for an image used by Karpenter to launch nodes.
