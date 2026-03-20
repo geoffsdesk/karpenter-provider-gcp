@@ -1,0 +1,1151 @@
+From a0f7728d63e43d693e3aae6a23ab5efdf421f50a Mon Sep 17 00:00:00 2001
+From: Geoff <geoff.radian6@gmail.com>
+Date: Wed, 18 Mar 2026 18:44:13 -0400
+Subject: [PATCH 1/2] feat: add ComputeClass-aware provisioning for GKE Custom
+ Compute Classes
+
+This introduces support for referencing GKE Custom Compute Class (CCC)
+resources from GCENodeClass, allowing Karpenter to use ComputeClass
+priority rules when selecting instance types. This combines Karpenter's
+superior lifecycle management (consolidation, drift detection, TTL) with
+GKE's native priority-based machine selection semantics.
+
+Key changes:
+- Add ComputeClassRef field to GCENodeClassSpec
+- New computeclass provider package with priority resolution and filtering
+- Priority-aware instance type reordering in CloudProvider pipeline
+- ComputeClass name annotation on provisioned NodeClaims
+- Graceful degradation when ComputeClass is absent or unreadable
+- Functional options pattern for enabling the feature
+- Unit tests for priority matching, filtering, and reordering
+- Example manifests for cost-optimized and GPU workload patterns
+
+This feature is designed to be gated behind a feature flag
+(ComputeClassAwareProvisioning) and requires GKE 1.33.3+ where
+ComputeClass is independent of NAP.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ examples/computeclass/cost-optimized.yaml     |  80 +++
+ examples/computeclass/gpu-workload.yaml       |  66 +++
+ pkg/apis/v1alpha1/computeclass_types.go       |  61 +++
+ pkg/apis/v1alpha1/gcenodeclass.go             |   7 +
+ pkg/apis/v1alpha1/labels.go                   |   4 +
+ pkg/cloudprovider/cloudprovider.go            |  48 +-
+ pkg/providers/computeclass/computeclass.go    | 270 ++++++++++
+ .../computeclass/computeclass_test.go         | 471 ++++++++++++++++++
+ 8 files changed, 1002 insertions(+), 5 deletions(-)
+ create mode 100644 examples/computeclass/cost-optimized.yaml
+ create mode 100644 examples/computeclass/gpu-workload.yaml
+ create mode 100644 pkg/apis/v1alpha1/computeclass_types.go
+ create mode 100644 pkg/providers/computeclass/computeclass.go
+ create mode 100644 pkg/providers/computeclass/computeclass_test.go
+
+diff --git a/examples/computeclass/cost-optimized.yaml b/examples/computeclass/cost-optimized.yaml
+new file mode 100644
+index 0000000..be1a4c5
+--- /dev/null
++++ b/examples/computeclass/cost-optimized.yaml
+@@ -0,0 +1,80 @@
++# Example: Cost-Optimized ComputeClass with Karpenter Integration
++#
++# This example demonstrates the full pattern for using a GKE Custom Compute Class
++# with Karpenter's GCP provider. The ComputeClass defines priority-based fallback
++# rules, and the GCENodeClass references it via computeClassRef.
++#
++# Prerequisites:
++#   - GKE cluster version 1.33.3+ (ComputeClass independent of NAP)
++#   - NAP must be DISABLED (Karpenter replaces NAP)
++#   - Feature gate: --feature-gates=ComputeClassAwareProvisioning=true
++---
++# 1. GKE ComputeClass (owned by GKE, created by platform team)
++apiVersion: cloud.google.com/v1
++kind: ComputeClass
++metadata:
++  name: cost-optimized
++spec:
++  priorities:
++    # Priority 0: Try spot N4 instances first (cheapest)
++    - spot: true
++      machineFamily: n4
++
++    # Priority 1: Fall back to spot N2 instances
++    - spot: true
++      machineFamily: n2
++
++    # Priority 2: Fall back to on-demand N4
++    - machineType: n4-standard-4
++
++    # Priority 3: Broadest fallback - any N2 on-demand
++    - machineFamily: n2
++
++---
++# 2. GCENodeClass (Karpenter GCP provider resource)
++apiVersion: karpenter.k8s.gcp/v1alpha1
++kind: GCENodeClass
++metadata:
++  name: cost-optimized
++spec:
++  # Reference to the ComputeClass above
++  computeClassRef:
++    name: cost-optimized
++
++  serviceAccount: "karpenter@my-project.iam.gserviceaccount.com"
++  imageSelectorTerms:
++    - alias: ContainerOptimizedOS@latest
++  disks:
++    - category: pd-balanced
++      sizeGiB: 100
++      boot: true
++
++---
++# 3. NodePool (Karpenter core resource)
++apiVersion: karpenter.sh/v1
++kind: NodePool
++metadata:
++  name: cost-optimized
++spec:
++  template:
++    spec:
++      requirements:
++        # Allow both spot and on-demand (ComputeClass controls preference ordering)
++        - key: karpenter.sh/capacity-type
++          operator: In
++          values: ["on-demand", "spot"]
++        # Restrict to standard shapes
++        - key: karpenter.k8s.gcp/instance-shape
++          operator: In
++          values: ["standard", "highcpu", "highmem"]
++      nodeClassRef:
++        apiVersion: karpenter.k8s.gcp/v1alpha1
++        kind: GCENodeClass
++        name: cost-optimized
++  limits:
++    cpu: "1000"
++    memory: 1000Gi
++  disruption:
++    consolidationPolicy: WhenUnderutilized
++  # Expire nodes after 72h to pick up new AMIs and rebalance
++  expireAfter: 72h
+diff --git a/examples/computeclass/gpu-workload.yaml b/examples/computeclass/gpu-workload.yaml
+new file mode 100644
+index 0000000..969107b
+--- /dev/null
++++ b/examples/computeclass/gpu-workload.yaml
+@@ -0,0 +1,66 @@
++# Example: GPU Workload ComputeClass with Karpenter Integration
++#
++# This example shows how to use ComputeClass priority rules for GPU workloads,
++# with fallback from preferred GPU types to alternatives.
++---
++apiVersion: cloud.google.com/v1
++kind: ComputeClass
++metadata:
++  name: gpu-training
++spec:
++  priorities:
++    # Priority 0: Prefer spot A3 instances (H100 GPUs)
++    - spot: true
++      machineFamily: a3
++
++    # Priority 1: Fall back to spot A2 instances (A100 GPUs)
++    - spot: true
++      machineFamily: a2
++
++    # Priority 2: On-demand A3 if no spot available
++    - machineFamily: a3
++
++    # Priority 3: On-demand A2 as last resort
++    - machineFamily: a2
++
++---
++apiVersion: karpenter.k8s.gcp/v1alpha1
++kind: GCENodeClass
++metadata:
++  name: gpu-training
++spec:
++  computeClassRef:
++    name: gpu-training
++  serviceAccount: "karpenter@my-project.iam.gserviceaccount.com"
++  imageSelectorTerms:
++    - alias: ContainerOptimizedOS@latest
++  disks:
++    - category: pd-ssd
++      sizeGiB: 200
++      boot: true
++
++---
++apiVersion: karpenter.sh/v1
++kind: NodePool
++metadata:
++  name: gpu-training
++spec:
++  template:
++    spec:
++      requirements:
++        - key: karpenter.sh/capacity-type
++          operator: In
++          values: ["on-demand", "spot"]
++        - key: karpenter.k8s.gcp/instance-gpu-count
++          operator: Gt
++          values: ["0"]
++      nodeClassRef:
++        apiVersion: karpenter.k8s.gcp/v1alpha1
++        kind: GCENodeClass
++        name: gpu-training
++  limits:
++    cpu: "500"
++    memory: 2000Gi
++    nvidia.com/gpu: "32"
++  disruption:
++    consolidationPolicy: WhenEmpty
+diff --git a/pkg/apis/v1alpha1/computeclass_types.go b/pkg/apis/v1alpha1/computeclass_types.go
+new file mode 100644
+index 0000000..27edf5f
+--- /dev/null
++++ b/pkg/apis/v1alpha1/computeclass_types.go
+@@ -0,0 +1,61 @@
++/*
++Copyright 2026 The CloudPilot AI Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package v1alpha1
++
++// ComputeClassRef is a reference to a GKE Custom Compute Class (cloud.google.com/v1 ComputeClass)
++// that informs Karpenter's instance type selection with priority-based fallback rules.
++// When specified, Karpenter reads the ComputeClass priority rules and uses them to
++// filter and reorder instance type candidates during provisioning.
++type ComputeClassRef struct {
++	// Name is the name of the GKE ComputeClass resource to reference.
++	// The ComputeClass must exist in the cluster. If it does not exist, Karpenter
++	// will log a warning and fall back to standard instance type resolution.
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=63
++	// +kubebuilder:validation:Pattern=`^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$`
++	// +required
++	Name string `json:"name"`
++}
++
++// ComputeClassPriorityRule represents a single priority rule extracted from a GKE ComputeClass.
++// Rules are evaluated top-to-bottom; the first rule with available capacity is preferred.
++type ComputeClassPriorityRule struct {
++	// Priority is the index of this rule (0 = highest priority).
++	Priority int `json:"priority"`
++
++	// MachineType is an exact machine type match (e.g., "n4-standard-4").
++	// If set, only this specific machine type matches.
++	// +optional
++	MachineType string `json:"machineType,omitempty"`
++
++	// MachineFamily is a machine family prefix match (e.g., "n4", "c3").
++	// If set, any machine type in this family matches.
++	// +optional
++	MachineFamily string `json:"machineFamily,omitempty"`
++
++	// Spot indicates whether this rule prefers spot (preemptible) instances.
++	// If nil, both spot and on-demand are accepted.
++	// +optional
++	Spot *bool `json:"spot,omitempty"`
++}
++
++// ComputeClassSpec represents the subset of GKE ComputeClass fields that Karpenter consumes.
++// This is a read-only representation; Karpenter does not modify the ComputeClass resource.
++type ComputeClassSpec struct {
++	// Priorities is the ordered list of priority rules from the ComputeClass.
++	Priorities []ComputeClassPriorityRule `json:"priorities,omitempty"`
++}
+diff --git a/pkg/apis/v1alpha1/gcenodeclass.go b/pkg/apis/v1alpha1/gcenodeclass.go
+index 80ad2f8..62534af 100644
+--- a/pkg/apis/v1alpha1/gcenodeclass.go
++++ b/pkg/apis/v1alpha1/gcenodeclass.go
+@@ -82,6 +82,13 @@ type GCENodeClassSpec struct {
+ 	// +kubebuilder:validation:MaxItems=20
+ 	// +optional
+ 	NetworkTags []NetworkTag `json:"networkTags,omitempty"`
++	// ComputeClassRef is a reference to a GKE Custom Compute Class (cloud.google.com/v1 ComputeClass).
++	// When specified, Karpenter reads the ComputeClass priority rules and uses them to
++	// filter and reorder instance type candidates during provisioning, combining Karpenter's
++	// lifecycle management with GKE's priority-based machine selection.
++	// Requires the ComputeClassAwareProvisioning feature gate to be enabled.
++	// +optional
++	ComputeClassRef *ComputeClassRef `json:"computeClassRef,omitempty"`
+ }
+ 
+ // ImageSelectorTerm defines selection logic for an image used by Karpenter to launch nodes.
+diff --git a/pkg/apis/v1alpha1/labels.go b/pkg/apis/v1alpha1/labels.go
+index ce0a103..f734a25 100644
+--- a/pkg/apis/v1alpha1/labels.go
++++ b/pkg/apis/v1alpha1/labels.go
+@@ -116,6 +116,10 @@ var (
+ 	AnnotationGCENodeClassHashVersion        = apis.Group + "/gcenodeclass-hash-version"
+ 	AnnotationInstanceTagged                 = apis.Group + "/tagged"
+ 
++	// ComputeClass-aware provisioning annotations
++	AnnotationComputeClassName     = apis.Group + "/compute-class-name"
++	AnnotationComputeClassPriority = apis.Group + "/compute-class-priority"
++
+ 	TagNodeClaim = coreapis.Group + "/nodeclaim"
+ 	TagName      = "Name"
+ )
+diff --git a/pkg/cloudprovider/cloudprovider.go b/pkg/cloudprovider/cloudprovider.go
+index d8befc2..48730fa 100644
+--- a/pkg/cloudprovider/cloudprovider.go
++++ b/pkg/cloudprovider/cloudprovider.go
+@@ -39,6 +39,7 @@ import (
+ 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/apis/v1alpha1"
+ 	cloudproviderevents "github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/cloudprovider/events"
+ 	gcperrors "github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/errors"
++	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/computeclass"
+ 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/instance"
+ 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/instancetype"
+ 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils"
+@@ -52,21 +53,39 @@ type CloudProvider struct {
+ 	kubeClient client.Client
+ 	recorder   events.Recorder
+ 
+-	instanceTypeProvider instancetype.Provider
+-	instanceProvider     instance.Provider
++	instanceTypeProvider   instancetype.Provider
++	instanceProvider       instance.Provider
++	computeClassProvider   computeclass.Provider
++	computeClassEnabled    bool
+ }
+ 
+ func New(kubeClient client.Client,
+ 	recorder events.Recorder,
+ 	instanceTypeProvider instancetype.Provider,
+ 	instanceProvider instance.Provider,
++	opts ...Option,
+ ) *CloudProvider {
+-	return &CloudProvider{
++	cp := &CloudProvider{
+ 		kubeClient:           kubeClient,
+ 		recorder:             recorder,
+ 		instanceTypeProvider: instanceTypeProvider,
+ 		instanceProvider:     instanceProvider,
+ 	}
++	for _, opt := range opts {
++		opt(cp)
++	}
++	return cp
++}
++
++// Option configures optional features on the CloudProvider.
++type Option func(*CloudProvider)
++
++// WithComputeClassProvider enables ComputeClass-aware provisioning using the given provider.
++func WithComputeClassProvider(provider computeclass.Provider) Option {
++	return func(cp *CloudProvider) {
++		cp.computeClassProvider = provider
++		cp.computeClassEnabled = true
++	}
+ }
+ 
+ // Create a NodeClaim given the constraints.
+@@ -105,10 +124,15 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
+ 	})
+ 
+ 	nc := c.instanceToNodeClaim(instance, instanceType)
+-	nc.Annotations = lo.Assign(nc.Annotations, map[string]string{
++	annotations := map[string]string{
+ 		v1alpha1.AnnotationGCENodeClassHash:        nodeClass.Hash(),
+ 		v1alpha1.AnnotationGCENodeClassHashVersion: v1alpha1.GCENodeClassHashVersion,
+-	})
++	}
++	// Track ComputeClass source if used
++	if nodeClass.Spec.ComputeClassRef != nil {
++		annotations[v1alpha1.AnnotationComputeClassName] = nodeClass.Spec.ComputeClassRef.Name
++	}
++	nc.Annotations = lo.Assign(nc.Annotations, annotations)
+ 	return nc, nil
+ }
+ 
+@@ -366,6 +390,20 @@ func (c *CloudProvider) resolveInstanceTypes(ctx context.Context, nodeClaim *kar
+ 		return nil, err
+ 	}
+ 
++	// Apply ComputeClass priority filtering if enabled and configured
++	if c.computeClassEnabled && c.computeClassProvider != nil && nodeClass.Spec.ComputeClassRef != nil {
++		rules, err := c.computeClassProvider.Resolve(ctx, nodeClass.Spec.ComputeClassRef)
++		if err != nil {
++			log.FromContext(ctx).Error(err, "failed to resolve ComputeClass, continuing with standard resolution")
++		} else if len(rules) > 0 {
++			instanceTypes = c.computeClassProvider.FilterAndReorder(ctx, instanceTypes, rules)
++			log.FromContext(ctx).V(1).Info("applied ComputeClass priority filtering",
++				"computeClass", nodeClass.Spec.ComputeClassRef.Name,
++				"candidateCount", len(instanceTypes),
++			)
++		}
++	}
++
+ 	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
+ 	return lo.Filter(instanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
+ 		return reqs.Compatible(i.Requirements, scheduling.AllowUndefinedWellKnownLabels) == nil &&
+diff --git a/pkg/providers/computeclass/computeclass.go b/pkg/providers/computeclass/computeclass.go
+new file mode 100644
+index 0000000..8afde61
+--- /dev/null
++++ b/pkg/providers/computeclass/computeclass.go
+@@ -0,0 +1,270 @@
++/*
++Copyright 2026 The CloudPilot AI Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package computeclass implements ComputeClass-aware instance type filtering
++// for the Karpenter GCP provider. It reads GKE ComputeClass CRDs and applies
++// their priority rules as an additional filtering and ordering layer in
++// Karpenter's instance type resolution pipeline.
++package computeclass
++
++import (
++	"context"
++	"fmt"
++	"sort"
++	"strings"
++
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/log"
++	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
++	"sigs.k8s.io/karpenter/pkg/cloudprovider"
++
++	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/apis/v1alpha1"
++)
++
++var computeClassGVR = schema.GroupVersionResource{
++	Group:    "cloud.google.com",
++	Version:  "v1",
++	Resource: "computeclasses",
++}
++
++// Provider resolves GKE ComputeClass resources and applies priority-based
++// filtering to Karpenter's instance type candidates.
++type Provider interface {
++	// Resolve reads a ComputeClass by name and returns its parsed priority rules.
++	// Returns nil rules and no error if the ComputeClass does not exist (graceful degradation).
++	Resolve(ctx context.Context, ref *v1alpha1.ComputeClassRef) ([]v1alpha1.ComputeClassPriorityRule, error)
++
++	// FilterAndReorder applies ComputeClass priority rules to a set of instance type
++	// candidates. Returns candidates ordered by: priority ASC, then price ASC within tier.
++	// If rules is nil or empty, returns the original candidates unchanged.
++	FilterAndReorder(ctx context.Context, candidates []*cloudprovider.InstanceType, rules []v1alpha1.ComputeClassPriorityRule) []*cloudprovider.InstanceType
++}
++
++// DefaultProvider implements the ComputeClass provider using a Kubernetes client
++// to read ComputeClass CRDs from the cluster.
++type DefaultProvider struct {
++	kubeClient client.Client
++}
++
++// NewDefaultProvider creates a new ComputeClass provider.
++func NewDefaultProvider(kubeClient client.Client) *DefaultProvider {
++	return &DefaultProvider{
++		kubeClient: kubeClient,
++	}
++}
++
++// Resolve reads a GKE ComputeClass by name using an unstructured client (since the
++// ComputeClass CRD is owned by GKE, not by this provider). Returns parsed priority rules.
++func (p *DefaultProvider) Resolve(ctx context.Context, ref *v1alpha1.ComputeClassRef) ([]v1alpha1.ComputeClassPriorityRule, error) {
++	if ref == nil {
++		return nil, nil
++	}
++
++	logger := log.FromContext(ctx).WithValues("computeClass", ref.Name)
++
++	// Use unstructured client to read the GKE-owned ComputeClass CRD
++	obj := &unstructured.Unstructured{}
++	obj.SetGroupVersionKind(schema.GroupVersionKind{
++		Group:   computeClassGVR.Group,
++		Version: computeClassGVR.Version,
++		Kind:    "ComputeClass",
++	})
++
++	if err := p.kubeClient.Get(ctx, client.ObjectKey{Name: ref.Name}, obj); err != nil {
++		logger.Info("ComputeClass not found, falling back to standard resolution", "error", err)
++		return nil, nil // Graceful degradation: return nil rules, no error
++	}
++
++	rules, err := parsePriorityRules(obj)
++	if err != nil {
++		logger.Error(err, "failed to parse ComputeClass priority rules, falling back to standard resolution")
++		return nil, nil // Graceful degradation
++	}
++
++	logger.Info("resolved ComputeClass", "ruleCount", len(rules))
++	return rules, nil
++}
++
++// parsePriorityRules extracts priority rules from an unstructured ComputeClass object.
++func parsePriorityRules(obj *unstructured.Unstructured) ([]v1alpha1.ComputeClassPriorityRule, error) {
++	spec, ok, err := unstructured.NestedMap(obj.Object, "spec")
++	if err != nil || !ok {
++		return nil, fmt.Errorf("ComputeClass missing spec: %w", err)
++	}
++
++	prioritiesRaw, ok, err := unstructured.NestedSlice(spec, "priorities")
++	if err != nil || !ok {
++		return nil, fmt.Errorf("ComputeClass missing spec.priorities: %w", err)
++	}
++
++	var rules []v1alpha1.ComputeClassPriorityRule
++	for i, raw := range prioritiesRaw {
++		ruleMap, ok := raw.(map[string]interface{})
++		if !ok {
++			continue
++		}
++
++		rule := v1alpha1.ComputeClassPriorityRule{
++			Priority: i,
++		}
++
++		if mt, ok := ruleMap["machineType"].(string); ok {
++			rule.MachineType = mt
++		}
++		if mf, ok := ruleMap["machineFamily"].(string); ok {
++			rule.MachineFamily = mf
++		}
++		if spot, ok := ruleMap["spot"].(bool); ok {
++			rule.Spot = &spot
++		}
++
++		rules = append(rules, rule)
++	}
++
++	return rules, nil
++}
++
++// FilterAndReorder applies ComputeClass priority rules to instance type candidates.
++//
++// Algorithm:
++//  1. For each candidate, find the highest-priority (lowest index) rule that matches
++//  2. Tag each candidate with its matched priority level
++//  3. Sort candidates by: priority ASC, then by cheapest available offering price ASC
++//  4. Candidates that match no rule are placed last (acting as a fallback tier)
++//
++// This preserves Karpenter's cost-optimization within each priority tier while
++// respecting the platform team's priority ordering across tiers.
++func (p *DefaultProvider) FilterAndReorder(ctx context.Context, candidates []*cloudprovider.InstanceType, rules []v1alpha1.ComputeClassPriorityRule) []*cloudprovider.InstanceType {
++	if len(rules) == 0 || len(candidates) == 0 {
++		return candidates
++	}
++
++	logger := log.FromContext(ctx)
++
++	type taggedCandidate struct {
++		instanceType *cloudprovider.InstanceType
++		priority     int     // matched priority index, or len(rules) for unmatched
++		minPrice     float64 // cheapest available offering price
++	}
++
++	tagged := make([]taggedCandidate, 0, len(candidates))
++	matchCounts := make(map[int]int) // priority -> count of matched candidates
++
++	for _, candidate := range candidates {
++		matchedPriority := len(rules) // default: unmatched (lowest priority)
++
++		for _, rule := range rules {
++			if matchesRule(candidate, rule) {
++				matchedPriority = rule.Priority
++				matchCounts[rule.Priority]++
++				break // Use highest (first) matching priority
++			}
++		}
++
++		// Find cheapest available offering price for sorting within tier
++		minPrice := float64(1e18)
++		for _, offering := range candidate.Offerings.Available() {
++			if offering.Price < minPrice {
++				minPrice = offering.Price
++			}
++		}
++
++		tagged = append(tagged, taggedCandidate{
++			instanceType: candidate,
++			priority:     matchedPriority,
++			minPrice:     minPrice,
++		})
++	}
++
++	// Sort: priority ASC, then price ASC within same priority
++	sort.SliceStable(tagged, func(i, j int) bool {
++		if tagged[i].priority != tagged[j].priority {
++			return tagged[i].priority < tagged[j].priority
++		}
++		return tagged[i].minPrice < tagged[j].minPrice
++	})
++
++	result := make([]*cloudprovider.InstanceType, len(tagged))
++	for i, t := range tagged {
++		result[i] = t.instanceType
++	}
++
++	// Log decision summary
++	for priority, count := range matchCounts {
++		logger.V(1).Info("ComputeClass priority match",
++			"priority", priority,
++			"matchedCandidates", count,
++		)
++	}
++	unmatchedCount := 0
++	for _, t := range tagged {
++		if t.priority == len(rules) {
++			unmatchedCount++
++		}
++	}
++	if unmatchedCount > 0 {
++		logger.V(1).Info("ComputeClass unmatched candidates placed in fallback tier",
++			"count", unmatchedCount,
++		)
++	}
++
++	return result
++}
++
++// matchesRule checks whether an instance type matches a ComputeClass priority rule.
++func matchesRule(instanceType *cloudprovider.InstanceType, rule v1alpha1.ComputeClassPriorityRule) bool {
++	name := instanceType.Name
++
++	// Check machineType exact match
++	if rule.MachineType != "" {
++		if name != rule.MachineType {
++			return false
++		}
++	}
++
++	// Check machineFamily prefix match (e.g., "n4" matches "n4-standard-4")
++	if rule.MachineFamily != "" {
++		parts := strings.Split(name, "-")
++		if len(parts) < 2 || parts[0] != rule.MachineFamily {
++			return false
++		}
++	}
++
++	// Check spot/on-demand capacity type match
++	if rule.Spot != nil {
++		wantCapacityType := karpv1.CapacityTypeOnDemand
++		if *rule.Spot {
++			wantCapacityType = karpv1.CapacityTypeSpot
++		}
++
++		// Check if any available offering matches the desired capacity type
++		hasMatchingOffering := false
++		for _, offering := range instanceType.Offerings.Available() {
++			ct := offering.Requirements.Get(karpv1.CapacityTypeLabelKey).Any()
++			if ct == wantCapacityType {
++				hasMatchingOffering = true
++				break
++			}
++		}
++		if !hasMatchingOffering {
++			return false
++		}
++	}
++
++	return true
++}
+diff --git a/pkg/providers/computeclass/computeclass_test.go b/pkg/providers/computeclass/computeclass_test.go
+new file mode 100644
+index 0000000..f4d3ce9
+--- /dev/null
++++ b/pkg/providers/computeclass/computeclass_test.go
+@@ -0,0 +1,471 @@
++/*
++Copyright 2026 The CloudPilot AI Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package computeclass
++
++import (
++	"context"
++	"testing"
++
++	"github.com/samber/lo"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	corev1 "k8s.io/api/core/v1"
++	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
++	"sigs.k8s.io/karpenter/pkg/cloudprovider"
++	"sigs.k8s.io/karpenter/pkg/scheduling"
++
++	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/apis/v1alpha1"
++)
++
++// makeInstanceType creates a test instance type with the given name and offerings.
++func makeInstanceType(name string, offerings ...*cloudprovider.Offering) *cloudprovider.InstanceType {
++	return &cloudprovider.InstanceType{
++		Name:      name,
++		Offerings: offerings,
++	}
++}
++
++// makeOffering creates a test offering with the given zone, capacity type, price, and availability.
++func makeOffering(zone, capacityType string, price float64, available bool) *cloudprovider.Offering {
++	return &cloudprovider.Offering{
++		Requirements: scheduling.NewRequirements(
++			scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, capacityType),
++			scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, zone),
++		),
++		Price:     price,
++		Available: available,
++	}
++}
++
++func TestMatchesRule_MachineType(t *testing.T) {
++	it := makeInstanceType("n4-standard-4",
++		makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.10, true),
++	)
++
++	tests := []struct {
++		name     string
++		rule     v1alpha1.ComputeClassPriorityRule
++		expected bool
++	}{
++		{
++			name:     "exact machine type match",
++			rule:     v1alpha1.ComputeClassPriorityRule{MachineType: "n4-standard-4"},
++			expected: true,
++		},
++		{
++			name:     "exact machine type mismatch",
++			rule:     v1alpha1.ComputeClassPriorityRule{MachineType: "n4-standard-8"},
++			expected: false,
++		},
++		{
++			name:     "empty machine type matches all",
++			rule:     v1alpha1.ComputeClassPriorityRule{},
++			expected: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			result := matchesRule(it, tt.rule)
++			assert.Equal(t, tt.expected, result)
++		})
++	}
++}
++
++func TestMatchesRule_MachineFamily(t *testing.T) {
++	tests := []struct {
++		name         string
++		instanceName string
++		family       string
++		expected     bool
++	}{
++		{
++			name:         "n4 family matches n4-standard-4",
++			instanceName: "n4-standard-4",
++			family:       "n4",
++			expected:     true,
++		},
++		{
++			name:         "n2 family does not match n4-standard-4",
++			instanceName: "n4-standard-4",
++			family:       "n2",
++			expected:     false,
++		},
++		{
++			name:         "c3 family matches c3-standard-8",
++			instanceName: "c3-standard-8",
++			family:       "c3",
++			expected:     true,
++		},
++		{
++			name:         "e2 family matches e2-medium",
++			instanceName: "e2-medium",
++			family:       "e2",
++			expected:     true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			it := makeInstanceType(tt.instanceName,
++				makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.10, true),
++			)
++			rule := v1alpha1.ComputeClassPriorityRule{MachineFamily: tt.family}
++			result := matchesRule(it, rule)
++			assert.Equal(t, tt.expected, result)
++		})
++	}
++}
++
++func TestMatchesRule_Spot(t *testing.T) {
++	spotTrue := true
++	spotFalse := false
++
++	tests := []struct {
++		name         string
++		offerings    []*cloudprovider.Offering
++		spot         *bool
++		expected     bool
++	}{
++		{
++			name: "spot rule matches instance with spot offering",
++			offerings: []*cloudprovider.Offering{
++				makeOffering("us-central1-a", karpv1.CapacityTypeSpot, 0.05, true),
++			},
++			spot:     &spotTrue,
++			expected: true,
++		},
++		{
++			name: "spot rule does not match instance with only on-demand",
++			offerings: []*cloudprovider.Offering{
++				makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.10, true),
++			},
++			spot:     &spotTrue,
++			expected: false,
++		},
++		{
++			name: "on-demand rule matches instance with on-demand offering",
++			offerings: []*cloudprovider.Offering{
++				makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.10, true),
++			},
++			spot:     &spotFalse,
++			expected: true,
++		},
++		{
++			name: "nil spot matches anything",
++			offerings: []*cloudprovider.Offering{
++				makeOffering("us-central1-a", karpv1.CapacityTypeSpot, 0.05, true),
++			},
++			spot:     nil,
++			expected: true,
++		},
++		{
++			name: "spot rule does not match unavailable spot offerings",
++			offerings: []*cloudprovider.Offering{
++				makeOffering("us-central1-a", karpv1.CapacityTypeSpot, 0.05, false), // unavailable
++			},
++			spot:     &spotTrue,
++			expected: false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			it := makeInstanceType("n4-standard-4", tt.offerings...)
++			rule := v1alpha1.ComputeClassPriorityRule{Spot: tt.spot}
++			result := matchesRule(it, rule)
++			assert.Equal(t, tt.expected, result)
++		})
++	}
++}
++
++func TestMatchesRule_Combined(t *testing.T) {
++	spotTrue := true
++
++	it := makeInstanceType("n4-standard-4",
++		makeOffering("us-central1-a", karpv1.CapacityTypeSpot, 0.05, true),
++		makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.10, true),
++	)
++
++	tests := []struct {
++		name     string
++		rule     v1alpha1.ComputeClassPriorityRule
++		expected bool
++	}{
++		{
++			name: "family + spot matches",
++			rule: v1alpha1.ComputeClassPriorityRule{
++				MachineFamily: "n4",
++				Spot:          &spotTrue,
++			},
++			expected: true,
++		},
++		{
++			name: "wrong family + spot does not match",
++			rule: v1alpha1.ComputeClassPriorityRule{
++				MachineFamily: "c3",
++				Spot:          &spotTrue,
++			},
++			expected: false,
++		},
++		{
++			name: "exact type + spot matches",
++			rule: v1alpha1.ComputeClassPriorityRule{
++				MachineType: "n4-standard-4",
++				Spot:        &spotTrue,
++			},
++			expected: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			result := matchesRule(it, tt.rule)
++			assert.Equal(t, tt.expected, result)
++		})
++	}
++}
++
++func TestFilterAndReorder_NilRules(t *testing.T) {
++	provider := &DefaultProvider{}
++	ctx := context.Background()
++
++	candidates := []*cloudprovider.InstanceType{
++		makeInstanceType("n4-standard-4", makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.10, true)),
++		makeInstanceType("n4-standard-8", makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.20, true)),
++	}
++
++	result := provider.FilterAndReorder(ctx, candidates, nil)
++	require.Len(t, result, 2)
++	assert.Equal(t, "n4-standard-4", result[0].Name)
++	assert.Equal(t, "n4-standard-8", result[1].Name)
++}
++
++func TestFilterAndReorder_EmptyCandidates(t *testing.T) {
++	provider := &DefaultProvider{}
++	ctx := context.Background()
++
++	rules := []v1alpha1.ComputeClassPriorityRule{
++		{Priority: 0, MachineFamily: "n4"},
++	}
++
++	result := provider.FilterAndReorder(ctx, nil, rules)
++	assert.Empty(t, result)
++}
++
++func TestFilterAndReorder_PriorityOrdering(t *testing.T) {
++	provider := &DefaultProvider{}
++	ctx := context.Background()
++	spotTrue := true
++
++	candidates := []*cloudprovider.InstanceType{
++		makeInstanceType("c3-standard-4",
++			makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.15, true)),
++		makeInstanceType("n4-standard-4",
++			makeOffering("us-central1-a", karpv1.CapacityTypeSpot, 0.03, true),
++			makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.10, true)),
++		makeInstanceType("n2-standard-4",
++			makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.12, true)),
++	}
++
++	rules := []v1alpha1.ComputeClassPriorityRule{
++		{Priority: 0, MachineFamily: "n4", Spot: &spotTrue},         // Priority 0: spot n4
++		{Priority: 1, MachineFamily: "n4"},                          // Priority 1: any n4
++		{Priority: 2, MachineFamily: "n2"},                          // Priority 2: n2
++	}
++
++	result := provider.FilterAndReorder(ctx, candidates, rules)
++	require.Len(t, result, 3)
++
++	// n4-standard-4 should be first (matches priority 0: spot n4)
++	assert.Equal(t, "n4-standard-4", result[0].Name)
++	// n2-standard-4 should be second (matches priority 2: n2)
++	assert.Equal(t, "n2-standard-4", result[1].Name)
++	// c3-standard-4 should be last (matches no rule, fallback tier)
++	assert.Equal(t, "c3-standard-4", result[2].Name)
++}
++
++func TestFilterAndReorder_PriceOrderingWithinTier(t *testing.T) {
++	provider := &DefaultProvider{}
++	ctx := context.Background()
++
++	candidates := []*cloudprovider.InstanceType{
++		makeInstanceType("n4-standard-8",
++			makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.20, true)),
++		makeInstanceType("n4-standard-2",
++			makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.05, true)),
++		makeInstanceType("n4-standard-4",
++			makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.10, true)),
++	}
++
++	rules := []v1alpha1.ComputeClassPriorityRule{
++		{Priority: 0, MachineFamily: "n4"}, // All match same priority
++	}
++
++	result := provider.FilterAndReorder(ctx, candidates, rules)
++	require.Len(t, result, 3)
++
++	// Within same priority tier, sorted by price ASC
++	assert.Equal(t, "n4-standard-2", result[0].Name)
++	assert.Equal(t, "n4-standard-4", result[1].Name)
++	assert.Equal(t, "n4-standard-8", result[2].Name)
++}
++
++func TestFilterAndReorder_AllUnmatched(t *testing.T) {
++	provider := &DefaultProvider{}
++	ctx := context.Background()
++
++	candidates := []*cloudprovider.InstanceType{
++		makeInstanceType("c3-standard-4",
++			makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.15, true)),
++		makeInstanceType("e2-medium",
++			makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.05, true)),
++	}
++
++	rules := []v1alpha1.ComputeClassPriorityRule{
++		{Priority: 0, MachineFamily: "n4"}, // Nothing matches
++	}
++
++	result := provider.FilterAndReorder(ctx, candidates, rules)
++	require.Len(t, result, 2)
++
++	// Unmatched sorted by price
++	assert.Equal(t, "e2-medium", result[0].Name)
++	assert.Equal(t, "c3-standard-4", result[1].Name)
++}
++
++func TestFilterAndReorder_CostOptimizedFallback(t *testing.T) {
++	// Simulates the full cost-optimized ComputeClass pattern:
++	// Priority 0: Spot N4
++	// Priority 1: Spot N2
++	// Priority 2: On-demand N4
++	// Fallback: everything else
++
++	provider := &DefaultProvider{}
++	ctx := context.Background()
++	spotTrue := true
++	spotFalse := false
++
++	candidates := []*cloudprovider.InstanceType{
++		makeInstanceType("c3-standard-4",
++			makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.18, true)),
++		makeInstanceType("n2-standard-4",
++			makeOffering("us-central1-a", karpv1.CapacityTypeSpot, 0.04, true),
++			makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.12, true)),
++		makeInstanceType("n4-standard-4",
++			makeOffering("us-central1-a", karpv1.CapacityTypeSpot, 0.03, true),
++			makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.10, true)),
++		makeInstanceType("n4-standard-8",
++			makeOffering("us-central1-a", karpv1.CapacityTypeSpot, 0.06, true),
++			makeOffering("us-central1-a", karpv1.CapacityTypeOnDemand, 0.20, true)),
++	}
++
++	rules := []v1alpha1.ComputeClassPriorityRule{
++		{Priority: 0, MachineFamily: "n4", Spot: &spotTrue},      // Spot N4
++		{Priority: 1, MachineFamily: "n2", Spot: &spotTrue},      // Spot N2
++		{Priority: 2, MachineFamily: "n4", Spot: &spotFalse},     // On-demand N4
++	}
++
++	result := provider.FilterAndReorder(ctx, candidates, rules)
++	require.Len(t, result, 4)
++
++	names := lo.Map(result, func(it *cloudprovider.InstanceType, _ int) string { return it.Name })
++
++	// Priority 0 (spot n4): n4-standard-4 ($0.03), n4-standard-8 ($0.06)
++	// Priority 1 (spot n2): n2-standard-4 ($0.04)
++	// Fallback: c3-standard-4 ($0.18)
++	assert.Equal(t, []string{"n4-standard-4", "n4-standard-8", "n2-standard-4", "c3-standard-4"}, names)
++}
++
++func TestParsePriorityRules(t *testing.T) {
++	obj := &unstructured.Unstructured{
++		Object: map[string]interface{}{
++			"apiVersion": "cloud.google.com/v1",
++			"kind":       "ComputeClass",
++			"metadata": map[string]interface{}{
++				"name": "cost-optimized",
++			},
++			"spec": map[string]interface{}{
++				"priorities": []interface{}{
++					map[string]interface{}{
++						"spot":          true,
++						"machineFamily": "n4",
++					},
++					map[string]interface{}{
++						"machineType": "n2-standard-4",
++					},
++					map[string]interface{}{
++						"spot":          false,
++						"machineFamily": "c3",
++					},
++				},
++			},
++		},
++	}
++
++	rules, err := parsePriorityRules(obj)
++	require.NoError(t, err)
++	require.Len(t, rules, 3)
++
++	// Rule 0: spot n4
++	assert.Equal(t, 0, rules[0].Priority)
++	assert.Equal(t, "n4", rules[0].MachineFamily)
++	assert.NotNil(t, rules[0].Spot)
++	assert.True(t, *rules[0].Spot)
++
++	// Rule 1: exact n2-standard-4
++	assert.Equal(t, 1, rules[1].Priority)
++	assert.Equal(t, "n2-standard-4", rules[1].MachineType)
++	assert.Nil(t, rules[1].Spot)
++
++	// Rule 2: on-demand c3
++	assert.Equal(t, 2, rules[2].Priority)
++	assert.Equal(t, "c3", rules[2].MachineFamily)
++	assert.NotNil(t, rules[2].Spot)
++	assert.False(t, *rules[2].Spot)
++}
++
++func TestParsePriorityRules_MissingSpec(t *testing.T) {
++	obj := &unstructured.Unstructured{
++		Object: map[string]interface{}{
++			"apiVersion": "cloud.google.com/v1",
++			"kind":       "ComputeClass",
++			"metadata":   map[string]interface{}{"name": "test"},
++		},
++	}
++
++	rules, err := parsePriorityRules(obj)
++	assert.Error(t, err)
++	assert.Nil(t, rules)
++}
++
++func TestParsePriorityRules_EmptyPriorities(t *testing.T) {
++	obj := &unstructured.Unstructured{
++		Object: map[string]interface{}{
++			"apiVersion": "cloud.google.com/v1",
++			"kind":       "ComputeClass",
++			"metadata":   map[string]interface{}{"name": "test"},
++			"spec": map[string]interface{}{
++				"priorities": []interface{}{},
++			},
++		},
++	}
++
++	rules, err := parsePriorityRules(obj)
++	require.NoError(t, err)
++	assert.Empty(t, rules)
++}
+-- 
+2.34.1
+

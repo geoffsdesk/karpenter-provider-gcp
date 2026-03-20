@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Karpenter ComputeClass Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+
+  .header { background: linear-gradient(135deg, #1e3a5f 0%, #0f172a 100%); padding: 24px 32px; border-bottom: 1px solid #1e293b; display: flex; justify-content: space-between; align-items: center; }
+  .header h1 { font-size: 22px; font-weight: 600; }
+  .header h1 span { color: #38bdf8; }
+  .header .status { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #94a3b8; }
+  .header .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .dot.green { background: #22c55e; box-shadow: 0 0 8px #22c55e80; }
+  .dot.yellow { background: #eab308; box-shadow: 0 0 8px #eab30880; }
+  .dot.red { background: #ef4444; box-shadow: 0 0 8px #ef444480; }
+
+  .controls { padding: 16px 32px; background: #1e293b; border-bottom: 1px solid #334155; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .btn { padding: 8px 16px; border-radius: 6px; border: 1px solid #475569; background: #334155; color: #e2e8f0; font-size: 13px; cursor: pointer; transition: all 0.2s; }
+  .btn:hover { background: #475569; }
+  .btn.primary { background: #2563eb; border-color: #3b82f6; }
+  .btn.primary:hover { background: #1d4ed8; }
+  .btn.danger { background: #dc2626; border-color: #ef4444; }
+  .btn.danger:hover { background: #b91c1c; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; padding: 24px 32px; }
+  .card { background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
+  .card h3 { font-size: 13px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+  .card .value { font-size: 36px; font-weight: 700; }
+  .card .subtitle { font-size: 12px; color: #64748b; margin-top: 4px; }
+  .value.blue { color: #38bdf8; }
+  .value.green { color: #22c55e; }
+  .value.amber { color: #f59e0b; }
+  .value.purple { color: #a78bfa; }
+
+  .section { padding: 0 32px 24px; }
+  .section h2 { font-size: 16px; font-weight: 600; margin-bottom: 12px; color: #cbd5e1; }
+
+  .priority-viz { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .priority-tier { flex: 1; min-width: 150px; background: #1e293b; border-radius: 8px; padding: 16px; border: 1px solid #334155; position: relative; overflow: hidden; }
+  .priority-tier.active { border-color: #22c55e; }
+  .priority-tier.active::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: #22c55e; }
+  .priority-tier.fallback { border-color: #f59e0b; }
+  .priority-tier.fallback::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: #f59e0b; }
+  .priority-tier .tier-label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; }
+  .priority-tier .tier-name { font-size: 15px; font-weight: 600; margin-top: 4px; }
+  .priority-tier .tier-detail { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+  .priority-tier .tier-count { font-size: 24px; font-weight: 700; color: #38bdf8; margin-top: 8px; }
+
+  .timeline { background: #1e293b; border-radius: 12px; border: 1px solid #334155; overflow: hidden; }
+  .timeline-header { padding: 16px 20px; border-bottom: 1px solid #334155; font-size: 14px; font-weight: 600; }
+  .timeline-body { max-height: 400px; overflow-y: auto; }
+  .event { padding: 12px 20px; border-bottom: 1px solid #1e293b; display: flex; gap: 12px; align-items: flex-start; font-size: 13px; transition: background 0.2s; }
+  .event:hover { background: #334155; }
+  .event:last-child { border-bottom: none; }
+  .event .time { color: #64748b; white-space: nowrap; font-family: 'SF Mono', Monaco, monospace; font-size: 12px; min-width: 80px; }
+  .event .badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+  .badge.provision { background: #166534; color: #86efac; }
+  .badge.priority { background: #1e3a5f; color: #7dd3fc; }
+  .badge.fallback { background: #713f12; color: #fde047; }
+  .badge.consolidate { background: #581c87; color: #d8b4fe; }
+  .badge.drift { background: #7f1d1d; color: #fca5a5; }
+  .badge.info { background: #334155; color: #94a3b8; }
+  .event .msg { color: #cbd5e1; line-height: 1.4; }
+
+  .node-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px; }
+  .node { background: #1e293b; border-radius: 8px; padding: 12px 16px; border: 1px solid #334155; font-size: 13px; }
+  .node .name { font-weight: 600; color: #e2e8f0; margin-bottom: 4px; font-family: monospace; font-size: 12px; }
+  .node .meta { color: #94a3b8; font-size: 12px; }
+  .node .meta span { margin-right: 12px; }
+  .node .cc-badge { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-top: 6px; }
+  .cc-badge.p0 { background: #166534; color: #86efac; }
+  .cc-badge.p1 { background: #1e3a5f; color: #7dd3fc; }
+  .cc-badge.p2 { background: #713f12; color: #fde047; }
+  .cc-badge.fallback { background: #334155; color: #94a3b8; }
+
+  .instructions { background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; margin-bottom: 16px; }
+  .instructions h3 { font-size: 14px; margin-bottom: 8px; }
+  .instructions code { background: #0f172a; padding: 2px 6px; border-radius: 3px; font-size: 12px; color: #38bdf8; }
+  .instructions pre { background: #0f172a; padding: 12px; border-radius: 6px; font-size: 12px; color: #94a3b8; margin-top: 8px; overflow-x: auto; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Karpenter <span>ComputeClass</span> Dashboard</h1>
+  <div class="status">
+    <div class="dot" id="statusDot"></div>
+    <span id="statusText">Awaiting data...</span>
+  </div>
+</div>
+
+<div class="controls">
+  <button class="btn primary" onclick="loadData()">Refresh Data</button>
+  <button class="btn" onclick="simulateProvisioning()">Simulate Provisioning</button>
+  <button class="btn" onclick="simulateConsolidation()">Simulate Consolidation</button>
+  <button class="btn danger" onclick="clearEvents()">Clear Log</button>
+  <span style="margin-left: auto; font-size: 12px; color: #64748b;">
+    Cluster: <strong style="color: #e2e8f0;" id="clusterName">—</strong> &nbsp;|&nbsp;
+    Region: <strong style="color: #e2e8f0;" id="clusterRegion">—</strong> &nbsp;|&nbsp;
+    Feature: <strong style="color: #22c55e;">ComputeClass ENABLED</strong>
+  </span>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h3>Active Nodes</h3>
+    <div class="value blue" id="nodeCount">0</div>
+    <div class="subtitle">Managed by Karpenter</div>
+  </div>
+  <div class="card">
+    <h3>ComputeClass Hit Rate</h3>
+    <div class="value green" id="hitRate">—</div>
+    <div class="subtitle">Provisions matching priority rules</div>
+  </div>
+  <div class="card">
+    <h3>Active Priority Tier</h3>
+    <div class="value amber" id="activeTier">—</div>
+    <div class="subtitle">Current highest-available tier</div>
+  </div>
+  <div class="card">
+    <h3>Est. Cost Savings</h3>
+    <div class="value purple" id="savings">—</div>
+    <div class="subtitle">vs. on-demand baseline</div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>ComputeClass Priority Tiers — <code id="ccName">cc-test-cost-optimized</code></h2>
+  <div class="priority-viz" id="priorityTiers"></div>
+</div>
+
+<div class="section">
+  <h2>Provisioned Nodes</h2>
+  <div class="node-list" id="nodeList">
+    <div style="color: #64748b; font-size: 13px; padding: 20px;">No Karpenter-managed nodes yet. Scale up a workload to trigger provisioning.</div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Event Timeline</h2>
+  <div class="timeline">
+    <div class="timeline-header">Provisioning Decisions</div>
+    <div class="timeline-body" id="eventLog"></div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="instructions">
+    <h3>How to populate this dashboard with live data</h3>
+    <p style="color: #94a3b8; font-size: 13px; margin-bottom: 8px;">
+      Run this command and paste the JSON output into the browser console, or pipe it to a file and load it:
+    </p>
+    <pre>
+# Generate dashboard data from your cluster
+kubectl get nodeclaims -o json | jq '{
+  nodes: [.items[] | {
+    name: .metadata.name,
+    type: .metadata.labels["node.kubernetes.io/instance-type"] // "unknown",
+    zone: .metadata.labels["topology.kubernetes.io/zone"] // "unknown",
+    capacity: .metadata.labels["karpenter.sh/capacity-type"] // "unknown",
+    cc_name: .metadata.annotations["karpenter.k8s.gcp/compute-class-name"] // null,
+    cc_priority: .metadata.annotations["karpenter.k8s.gcp/compute-class-priority"] // null,
+    created: .metadata.creationTimestamp
+  }]
+}'
+
+# Or watch Karpenter logs for ComputeClass decisions
+kubectl logs -n karpenter-system -l app.kubernetes.io/name=karpenter --tail=200 | grep -i "computeclass\|priority"</pre>
+  </div>
+</div>
+
+<script>
+// ── State ────────────────────────────────────────────────────────────────
+const state = {
+  nodes: [],
+  events: [],
+  computeClass: {
+    name: 'cc-test-cost-optimized',
+    priorities: [
+      { index: 0, label: 'Spot E2', family: 'e2', spot: true, matched: 0 },
+      { index: 1, label: 'Spot N2', family: 'n2', spot: true, matched: 0 },
+      { index: 2, label: 'On-Demand E2', family: 'e2', spot: false, matched: 0 },
+      { index: 3, label: 'On-Demand N2', family: 'n2', spot: false, matched: 0 },
+    ],
+    fallbackCount: 0
+  }
+};
+
+// ── Rendering ────────────────────────────────────────────────────────────
+function render() {
+  // Status
+  const dot = document.getElementById('statusDot');
+  const text = document.getElementById('statusText');
+  if (state.nodes.length > 0) {
+    dot.className = 'dot green';
+    text.textContent = `${state.nodes.length} node(s) active`;
+  } else if (state.events.length > 0) {
+    dot.className = 'dot yellow';
+    text.textContent = 'Monitoring...';
+  } else {
+    dot.className = 'dot yellow';
+    text.textContent = 'Awaiting data...';
+  }
+
+  // Metrics
+  document.getElementById('nodeCount').textContent = state.nodes.length;
+
+  const totalProvisions = state.computeClass.priorities.reduce((s, p) => s + p.matched, 0);
+  const total = totalProvisions + state.computeClass.fallbackCount;
+  document.getElementById('hitRate').textContent = total > 0
+    ? Math.round((totalProvisions / total) * 100) + '%'
+    : '—';
+
+  const activePriority = state.computeClass.priorities.find(p => p.matched > 0);
+  document.getElementById('activeTier').textContent = activePriority
+    ? `P${activePriority.index}: ${activePriority.label}`
+    : '—';
+
+  const spotNodes = state.nodes.filter(n => n.capacity === 'spot').length;
+  const totalNodes = state.nodes.length;
+  document.getElementById('savings').textContent = totalNodes > 0
+    ? `~${Math.round((spotNodes / totalNodes) * 60)}%`
+    : '—';
+
+  // Priority tiers
+  const tiersEl = document.getElementById('priorityTiers');
+  tiersEl.innerHTML = state.computeClass.priorities.map(p => `
+    <div class="priority-tier ${p.matched > 0 ? 'active' : ''}">
+      <div class="tier-label">Priority ${p.index}</div>
+      <div class="tier-name">${p.label}</div>
+      <div class="tier-detail">${p.family} family, ${p.spot ? 'spot' : 'on-demand'}</div>
+      <div class="tier-count">${p.matched}</div>
+    </div>
+  `).join('') + `
+    <div class="priority-tier ${state.computeClass.fallbackCount > 0 ? 'fallback' : ''}">
+      <div class="tier-label">Fallback</div>
+      <div class="tier-name">Other Types</div>
+      <div class="tier-detail">No priority match</div>
+      <div class="tier-count">${state.computeClass.fallbackCount}</div>
+    </div>
+  `;
+
+  // Nodes
+  const nodeListEl = document.getElementById('nodeList');
+  if (state.nodes.length === 0) {
+    nodeListEl.innerHTML = '<div style="color: #64748b; font-size: 13px; padding: 20px;">No Karpenter-managed nodes yet. Scale up a workload to trigger provisioning.</div>';
+  } else {
+    nodeListEl.innerHTML = state.nodes.map(n => {
+      const pClass = n.cc_priority !== null ? `p${n.cc_priority}` : 'fallback';
+      const pLabel = n.cc_priority !== null ? `Priority ${n.cc_priority}` : 'Fallback';
+      return `
+        <div class="node">
+          <div class="name">${n.name}</div>
+          <div class="meta">
+            <span>${n.type}</span>
+            <span>${n.capacity}</span>
+            <span>${n.zone}</span>
+          </div>
+          ${n.cc_name ? `<div class="cc-badge ${pClass}">${pLabel} — ${n.cc_name}</div>` : ''}
+        </div>`;
+    }).join('');
+  }
+
+  // Events
+  const eventsEl = document.getElementById('eventLog');
+  eventsEl.innerHTML = state.events.slice().reverse().map(e => `
+    <div class="event">
+      <span class="time">${e.time}</span>
+      <span class="badge ${e.type}">${e.label}</span>
+      <span class="msg">${e.message}</span>
+    </div>
+  `).join('');
+}
+
+// ── Event Logging ────────────────────────────────────────────────────────
+function addEvent(type, label, message) {
+  const now = new Date();
+  state.events.push({
+    time: now.toLocaleTimeString('en-US', { hour12: false }),
+    type, label, message
+  });
+  if (state.events.length > 100) state.events.shift();
+  render();
+}
+
+// ── Simulations ──────────────────────────────────────────────────────────
+function simulateProvisioning() {
+  addEvent('info', 'INFO', 'Pending pod detected: cc-test-workload (cpu: 250m, mem: 256Mi)');
+
+  setTimeout(() => {
+    addEvent('priority', 'PRIORITY', 'Resolved ComputeClass "cc-test-cost-optimized" with 4 priority rules');
+  }, 500);
+
+  setTimeout(() => {
+    addEvent('priority', 'P0 MATCH', 'Priority 0 (Spot E2): 12 candidates matched, cheapest: e2-standard-2 at $0.013/hr');
+  }, 1200);
+
+  setTimeout(() => {
+    const types = ['e2-standard-2', 'e2-standard-4', 'e2-medium'];
+    const type = types[Math.floor(Math.random() * types.length)];
+    const zones = ['europe-west4-a', 'europe-west4-b', 'europe-west4-c'];
+    const zone = zones[Math.floor(Math.random() * zones.length)];
+
+    const node = {
+      name: `cc-${Date.now().toString(36)}`,
+      type, zone,
+      capacity: 'spot',
+      cc_name: 'cc-test-cost-optimized',
+      cc_priority: '0'
+    };
+    state.nodes.push(node);
+    state.computeClass.priorities[0].matched++;
+
+    addEvent('provision', 'PROVISION', `Launched ${type} (spot) in ${zone} — ComputeClass priority 0`);
+  }, 2000);
+}
+
+function simulateConsolidation() {
+  if (state.nodes.length === 0) {
+    addEvent('info', 'INFO', 'No nodes to consolidate');
+    return;
+  }
+  addEvent('consolidate', 'CONSOLIDATE', 'Evaluating underutilized nodes for consolidation...');
+
+  setTimeout(() => {
+    const node = state.nodes[state.nodes.length - 1];
+    addEvent('consolidate', 'CONSOLIDATE', `Node ${node.name} (${node.type}) is underutilized. Checking higher-priority alternatives...`);
+  }, 800);
+
+  setTimeout(() => {
+    addEvent('priority', 'PRIORITY', 'ComputeClass priority check: P0 (Spot E2) capacity available — replacement would maintain or improve priority');
+  }, 1500);
+}
+
+function clearEvents() {
+  state.events = [];
+  render();
+}
+
+function loadData() {
+  const input = prompt(
+    'Paste the JSON output from:\n\n' +
+    'kubectl get nodeclaims -o json | jq \'{ nodes: ... }\'\n\n' +
+    'Or press Cancel to use current simulated data.'
+  );
+  if (!input) return;
+
+  try {
+    const data = JSON.parse(input);
+    if (data.nodes) {
+      state.nodes = data.nodes;
+      // Reset priority counts
+      state.computeClass.priorities.forEach(p => p.matched = 0);
+      state.computeClass.fallbackCount = 0;
+      // Count priorities
+      data.nodes.forEach(n => {
+        if (n.cc_priority !== null && n.cc_priority !== undefined) {
+          const idx = parseInt(n.cc_priority);
+          if (state.computeClass.priorities[idx]) {
+            state.computeClass.priorities[idx].matched++;
+          }
+        } else {
+          state.computeClass.fallbackCount++;
+        }
+      });
+      addEvent('info', 'DATA', `Loaded ${data.nodes.length} nodes from cluster`);
+    }
+  } catch (e) {
+    alert('Invalid JSON. Check the format and try again.');
+  }
+}
+
+// ── Cluster info (set via URL params: ?cluster=NAME&region=REGION) ───────
+const params = new URLSearchParams(window.location.search);
+document.getElementById('clusterName').textContent = params.get('cluster') || 'not set';
+document.getElementById('clusterRegion').textContent = params.get('region') || 'not set';
+
+// ── Init ─────────────────────────────────────────────────────────────────
+render();
+addEvent('info', 'INIT', 'Dashboard initialized. Click "Simulate Provisioning" for a demo or "Refresh Data" to load live cluster data.');
+</script>
+</body>
+</html>

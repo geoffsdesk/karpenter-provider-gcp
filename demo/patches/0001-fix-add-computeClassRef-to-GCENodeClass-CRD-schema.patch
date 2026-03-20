@@ -1,0 +1,47 @@
+From 4ad7566343e0635c1415d6125d424692ac25705d Mon Sep 17 00:00:00 2001
+From: Geoff <geoff.radian6@gmail.com>
+Date: Thu, 19 Mar 2026 08:41:05 -0400
+Subject: [PATCH] fix: add computeClassRef to GCENodeClass CRD schema
+
+The CRD YAML in charts/karpenter/crds/ needs the computeClassRef field
+added to the OpenAPI schema so Kubernetes accepts it during strict
+validation. Without this, kubectl apply rejects GCENodeClass resources
+that include computeClassRef.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ .../crds/karpenter.k8s.gcp_gcenodeclasses.yaml | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/charts/karpenter/crds/karpenter.k8s.gcp_gcenodeclasses.yaml b/charts/karpenter/crds/karpenter.k8s.gcp_gcenodeclasses.yaml
+index a182605..0e98d0a 100644
+--- a/charts/karpenter/crds/karpenter.k8s.gcp_gcenodeclasses.yaml
++++ b/charts/karpenter/crds/karpenter.k8s.gcp_gcenodeclasses.yaml
+@@ -338,6 +338,24 @@ spec:
+                 description: Metadata contains key/value pairs to set as instance
+                   metadata
+                 type: object
++              computeClassRef:
++                description: |-
++                  ComputeClassRef is a reference to a GKE Custom Compute Class (cloud.google.com/v1 ComputeClass).
++                  When specified, Karpenter reads the ComputeClass priority rules and uses them to
++                  filter and reorder instance type candidates during provisioning, combining Karpenter's
++                  lifecycle management with GKE's priority-based machine selection.
++                  Requires the ComputeClassAwareProvisioning feature gate to be enabled.
++                properties:
++                  name:
++                    description: Name is the name of the GKE ComputeClass resource to
++                      reference.
++                    maxLength: 63
++                    minLength: 1
++                    pattern: ^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$
++                    type: string
++                required:
++                - name
++                type: object
+               networkTags:
+                 description: NetworkTags is a list of network tags to apply to the
+                   node.
+-- 
+2.34.1
+

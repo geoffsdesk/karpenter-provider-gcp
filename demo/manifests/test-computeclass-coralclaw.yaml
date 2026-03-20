@@ -1,0 +1,94 @@
+# =============================================================================
+# Test Resources for ComputeClass-Aware Provisioning
+# Target: coralclaw-cluster (europe-west4) / first-cascade-490202-e3
+# =============================================================================
+---
+# 1. GKE ComputeClass — defines priority-based machine selection
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: cc-test-cost-optimized
+spec:
+  priorities:
+    # Priority 0: Try spot E2 instances first (cheapest for testing)
+    - spot: true
+      machineFamily: e2
+
+    # Priority 1: Fall back to spot N2 instances
+    - spot: true
+      machineFamily: n2
+
+    # Priority 2: On-demand E2 fallback
+    - machineFamily: e2
+
+    # Priority 3: Broadest on-demand fallback
+    - machineFamily: n2
+
+---
+# 2. GCENodeClass — references the ComputeClass
+apiVersion: karpenter.k8s.gcp/v1alpha1
+kind: GCENodeClass
+metadata:
+  name: cc-test
+spec:
+  computeClassRef:
+    name: cc-test-cost-optimized
+  imageSelectorTerms:
+    - alias: ContainerOptimizedOS@latest
+  disks:
+    - category: pd-balanced
+      sizeGiB: 50
+      boot: true
+
+---
+# 3. NodePool — uses the GCENodeClass with ComputeClass reference
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: cc-test-pool
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand", "spot"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+      nodeClassRef:
+        group: karpenter.k8s.gcp
+        kind: GCENodeClass
+        name: cc-test
+  limits:
+    cpu: "20"
+    memory: 40Gi
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 60s
+
+---
+# 4. Test workload — triggers Karpenter to provision a node
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cc-test-workload
+  labels:
+    app: cc-test
+spec:
+  replicas: 0  # Start at 0, scale up to trigger provisioning
+  selector:
+    matchLabels:
+      app: cc-test
+  template:
+    metadata:
+      labels:
+        app: cc-test
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
